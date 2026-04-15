@@ -12,10 +12,12 @@ from .player_data import SleeperPlayerData
 from .team_data import SleeperTeamData
 from .combine import ESPNCombineData
 from .college_stats import ESPNCollegeData
+from .loader       import DataLoader          # Move data to raw so the cleaning process can access it
 
 __all__ = [
     "SleeperPlayerData",
     "SleeperTeamData",
     "ESPNCombineData",
     "ESPNCollegeData",
+    "DataLoader",
 ]
