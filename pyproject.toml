@@ -1,0 +1,129 @@
+ =============================================================================
+# pyproject.toml
+# =============================================================================
+#
+# PURPOSE:
+#   This file replaces requirements.txt when using UV as your package manager.
+#   It tells UV what your project is called, what Python version it needs,
+#   and which external libraries (dependencies) it depends on.
+#
+# HOW TO INSTALL EVERYTHING AT ONCE:
+#   Make sure UV is installed, then run:
+#       uv sync
+#   UV will create/update a virtual environment and install every package below.
+#
+# HOW TO ADD A NEW PACKAGE LATER:
+#   Don't edit this file by hand — let UV do it:
+#       uv add <package-name>
+#   Example:  uv add requests
+#   UV will add it here AND update the uv.lock file automatically.
+#
+# WHAT IS uv.lock?
+#   After you run `uv sync` or `uv add`, UV creates a uv.lock file next to
+#   this one. That file pins the EXACT versions of every package (including
+#   packages-of-packages) so your project works the same on any computer.
+#   Commit uv.lock to Git — it's important.
+#
+# =============================================================================
+ 
+[project]
+name = "fantasy-football-rookie-predictor"
+version = "0.1.0"
+description = "Predicts which NFL rookies will become fantasy football stars using college stats, combine data, and NFL context."
+requires-python = ">=3.10"
+ 
+dependencies = [
+    # -------------------------------------------------------------------------
+    # DATA HANDLING
+    # Libraries for loading, cleaning, and manipulating data tables.
+    # -------------------------------------------------------------------------
+ 
+    # pandas — the core library for DataFrames (spreadsheet-like tables).
+    # Used in every file that builds or merges data.
+    "pandas>=2.2",
+ 
+    # numpy — fast math and array operations.
+    # pandas and scikit-learn are both built on top of numpy.
+    "numpy>=1.26",
+ 
+    # -------------------------------------------------------------------------
+    # HTTP / API REQUESTS
+    # Libraries for talking to external APIs over the internet.
+    # -------------------------------------------------------------------------
+ 
+    # requests — the standard library for making HTTP calls (GET, POST, etc.).
+    # Used in every data_intake file to call the Sleeper and College Football APIs.
+    "requests>=2.32",
+ 
+    # -------------------------------------------------------------------------
+    # NFL / COLLEGE DATA SOURCES
+    # Purpose-built libraries for pulling football data.
+    # -------------------------------------------------------------------------
+ 
+    # nfl_data_py — wrapper around nflverse data; used for combine measurements.
+    "nfl-data-py>=0.3",
+ 
+    # cfbd — official Python client for the College Football Data API.
+    "cfbd>=5.0",
+ 
+    # -------------------------------------------------------------------------
+    # MACHINE LEARNING
+    # Libraries for building, training, and evaluating predictive models.
+    # -------------------------------------------------------------------------
+ 
+    # scikit-learn — the go-to Python library for machine learning.
+    # Provides regression, classification, cross-validation, and preprocessing.
+    "scikit-learn>=1.4",
+ 
+    # joblib — saves and loads trained models to/from disk.
+    # Lets you train once and reload instantly on future runs.
+    "joblib>=1.4",
+ 
+    # -------------------------------------------------------------------------
+    # VISUALISATION
+    # Libraries for charts and interactive dashboards.
+    # -------------------------------------------------------------------------
+ 
+    # plotly — interactive charts (hover, zoom, click).
+    "plotly>=5.22",
+ 
+    # streamlit — turns Python scripts into shareable web apps.
+    # You'll use this to build the final prediction dashboard.
+    "streamlit>=1.35",
+ 
+    # -------------------------------------------------------------------------
+    # DATE / TIME UTILITIES
+    # -------------------------------------------------------------------------
+ 
+    # python-dateutil — smarter date handling than Python's built-in datetime.
+    # Used to dynamically calculate the current NFL season year.
+    "python-dateutil>=2.9",
+ 
+    # -------------------------------------------------------------------------
+    # NAME MATCHING
+    # -------------------------------------------------------------------------
+ 
+    # thefuzz — fuzzy string matching.
+    # Used to match player names that are spelled slightly differently across
+    # data sources (e.g. "CeeDee Lamb" vs "Cee Dee Lamb").
+    "thefuzz>=0.22",
+ 
+    # python-Levenshtein — speeds up thefuzz significantly.
+    # thefuzz works without it, but this makes it much faster.
+    "python-levenshtein>=0.25",
+ 
+    # -------------------------------------------------------------------------
+    # DEVELOPMENT UTILITIES
+    # -------------------------------------------------------------------------
+ 
+    # tqdm — adds a progress bar to any Python loop with one line of code.
+    # Useful when fetching hundreds of API records so you can see progress.
+    "tqdm>=4.66",
+ 
+    # jupyter — lets you run .ipynb notebook files for data exploration.
+    "jupyter>=1.0",
+ 
+    # ipykernel — connects Jupyter notebooks to the virtual environment
+    # that has all your packages installed. Required for VS Code notebooks.
+    "ipykernel>=6.29",
+]
