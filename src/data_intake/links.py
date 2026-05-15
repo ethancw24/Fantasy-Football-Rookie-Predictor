@@ -30,6 +30,15 @@ SLEEPER_PLAYER_STATS_URL = (
     "?season_type=regular&season={season}"
 )
 
+# Returns stats for ALL NFL players for an entire season in ONE request.
+# This is much faster than fetching one player at a time.
+# {season} = the season year (e.g. 2025)
+# Example: https://api.sleeper.app/v1/stats/nfl/regular/2025?season_type=regular
+SLEEPER_BATCH_STATS_URL = (
+    "https://api.sleeper.app/v1/stats/nfl/regular/{season}"
+    "?season_type=regular"
+)
+
 # Returns trending players (most added/dropped in fantasy leagues recently).
 # Useful as a quick check that the Sleeper API is responding.
 SLEEPER_TRENDING_URL = "https://api.sleeper.app/v1/players/nfl/trending/add"
@@ -85,15 +94,12 @@ CONSTANTS — shared settings used across multiple files
 today = date.today()
 year = today.year
 month = today.month
-currentYear = 0
-# Realistically only will need to run during these months anyway. The Fantasy drafts will only be between these months
+# Offseason (March-August): use last completed season (e.g. April 2026 → 2025)
+# In-season (September-February): use current year (e.g. October 2025 → 2025)
 if month >= 3 and month <= 8:
-    currentYear =  year - 1
+    CURRENT_NFL_SEASON = year - 1
 else:
-    currentYear = year
-
-
-CURRENT_NFL_SEASON = currentYear
+    CURRENT_NFL_SEASON = year
 
 # How many past NFL seasons of data to collect per player.
 # 3 seasons gives a good trend without making the project too slow.

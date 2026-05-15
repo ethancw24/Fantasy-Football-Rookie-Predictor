@@ -35,6 +35,8 @@
 # Libraries for loading, cleaning, and manipulating data tables.
 # -----------------------------------------------------------------------------
 
+pip install nfl_data_py
+
 # pandas — the core library for DataFrames (spreadsheet-like tables in Python).
 # Used in every file that builds or merges data.
 pandas==2.2.2
