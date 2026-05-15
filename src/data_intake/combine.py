@@ -171,6 +171,12 @@ class ESPNCombineData:
         }
         df = df.rename(columns=rename_map)
 
+        # ── Drop duplicate columns ─────────────────────────────────────────
+        # nfl_data_py sometimes already has a 'draft_year' column alongside
+        # 'season', so renaming 'season' → 'draft_year' creates two columns
+        # with the same name.  This keeps the first occurrence and drops the rest.
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
         # ── Filter to fantasy-relevant positions only ──────────────────────
         # We only care about QB, RB, WR, TE for our prediction model.
         if "position" in df.columns:
@@ -406,7 +412,7 @@ class DataCombiner:
             pd.notna(master["draft_year"]),
             master["draft_year"] - 1,    # preferred: accurate
             master["season"] - 1,        # fallback: approximate
-        ).astype("Int64")                # Int64 supports NaN; plain int does not
+        ).astype("float64")                # float64 supports NaN; plain int does not
 
         merged = pd.merge(
             master,

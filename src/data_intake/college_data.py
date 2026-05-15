@@ -311,8 +311,10 @@ class ESPNCollegeData:
             aggfunc = "first",
         ).reset_index()
 
-        # Flatten the column names (pivot_table can create multi-level columns)
         pivot.columns.name = None
+
+        # Add this line — converts all stat columns to numeric, bad values become NaN
+        pivot = pivot.apply(lambda col: pd.to_numeric(col, errors="coerce") if col.name not in ("player", "team") else col)
 
         # Rename statType columns to our naming convention
         pivot = pivot.rename(columns=stat_map)
@@ -351,9 +353,9 @@ class ESPNCollegeData:
         RETURNS:
             str | None : 'QB', 'RB', 'WR', or None.
         """
-        pass_yds = row.get("pass_yards", 0) or 0
-        rush_yds = row.get("rush_yards", 0) or 0
-        rec_yds  = row.get("rec_yards",  0) or 0
+        pass_yds = float(row.get("pass_yards", 0) or 0)
+        rush_yds = float(row.get("rush_yards", 0) or 0)
+        rec_yds  = float(row.get("rec_yards",  0) or 0)
 
         if pass_yds > 100 and pass_yds >= rush_yds and pass_yds >= rec_yds:
             return "QB"

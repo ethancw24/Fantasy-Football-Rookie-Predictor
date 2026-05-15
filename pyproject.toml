@@ -8,31 +8,25 @@ dependencies = [
     # Data handling
     "pandas>=2.2",
     "numpy>=1.26",
- 
     # HTTP / API requests
     "requests>=2.32",
- 
     # NFL / college data sources
     "nfl-data-py>=0.3",
     "cfbd>=5.0",
- 
     # Machine learning
     "scikit-learn>=1.4",
     "joblib>=1.4",
- 
     # Visualisation
     "plotly>=5.22",
     "streamlit>=1.35",
- 
     # Date / time utilities
     "python-dateutil>=2.9",
- 
     # Name matching
     "thefuzz>=0.22",
     "python-levenshtein>=0.25",
- 
     # Development utilities
     "tqdm>=4.66",
     "jupyter>=1.0",
     "ipykernel>=6.29",
+    "python-dotenv>=1.2.2",
 ]
