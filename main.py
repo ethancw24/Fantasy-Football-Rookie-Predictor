@@ -41,6 +41,22 @@ import argparse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# LOAD ENVIRONMENT VARIABLES FROM .env
+# ---------------------------------------------------------------------------
+# This must happen BEFORE any other imports that need environment variables
+# (specifically CFBD_API_KEY used by college_data.py).
+#
+# python-dotenv reads the .env file in your project root and loads each
+# line as an environment variable — exactly as if you had set them in
+# the terminal manually.
+#
+# IMPORTANT: .env is in your .gitignore and should never be committed
+# to GitHub — it contains your private API key.
+
+from dotenv import load_dotenv
+load_dotenv()   # loads .env from the current working directory
+
+# ---------------------------------------------------------------------------
 # MAKE SURE PYTHON CAN FIND THE src FOLDER
 # ---------------------------------------------------------------------------
 # Path(__file__).parent gives us the project root (the folder main.py is in).
@@ -58,6 +74,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # These imports only work after the sys.path line above.
 
 from data_intake.loader import DataLoader
+from data_intake.combine import DataCombiner   # merges the four separate DataFrames
 
 from data_cleaning import DataValidator, DataCleaner, FeatureEngineer
 
@@ -172,9 +189,24 @@ def run_data_intake(force_refresh: bool) -> "pd.DataFrame":
     for name, df in data.items():
         logger.info("  %-20s → %d rows × %d columns", name, len(df), len(df.columns))
 
-    # The "master" key holds all four sources merged together.
-    # This is what Stage 2 will clean and engineer features on.
-    master_df = data["master"]
+    # The loader returns four SEPARATE DataFrames — one per data source.
+    # We keep them separate through intake and cleaning to make debugging easier.
+    # Now we merge them into one master table using DataCombiner.
+    #
+    # WHY MERGE HERE AND NOT IN THE LOADER?
+    #   Merging messy pre-cleaned data is risky — join keys may be inconsistent.
+    #   Keeping them separate through intake lets us validate each source first.
+    #   DataCombiner uses LEFT joins so no player is ever dropped due to missing
+    #   combine or college data.
+    logger.info("\nMerging four DataFrames into master table…")
+    combiner  = DataCombiner()
+    master_df = combiner.merge_all(
+        nfl_df     = data["nfl_players"],
+        team_df    = data["teams"],
+        combine_df = data["combine"],
+        college_df = data["college"],
+    )
+
     logger.info(
         "\nMaster DataFrame: %d rows × %d columns — passing to Stage 2.\n",
         len(master_df), len(master_df.columns),

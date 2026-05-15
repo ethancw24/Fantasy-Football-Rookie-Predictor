@@ -4,9 +4,14 @@ data_intake/combine.py
 
 This file has TWO jobs — both relate to the word "combine":
 
-    PART A — ESPNCombineData
-        Fetches NFL Draft Combine *measurements* from ESPN
-        (40-yard dash, bench press, vertical jump, etc.)
+    PART A — ESPNCombineData  (despite the name, now uses nfl_data_py)
+        Fetches NFL Draft Combine *measurements*: 40-yard dash, bench press,
+        vertical jump, etc.
+
+        WHY WE SWITCHED FROM ESPN:
+            The ESPN hidden API started returning 404 errors for combine data.
+            nfl_data_py (which wraps the open nflverse project) is free,
+            documented, and actively maintained.  It's the better long-term choice.
 
     PART B — DataCombiner
         *Combines* (merges/joins) all four DataFrames into one master table
@@ -27,8 +32,8 @@ WHAT IS THE NFL COMBINE? (Part A)
         Bench Press (225lb) → upper-body strength          (more reps = stronger)
 
     ⚠  NOT EVERYONE ATTENDS.  Some players skip due to injury or agent advice.
-       Missing combine data shows up as NaN.  This is expected — we keep
-       those players using an outer/left join.
+       Missing measurements are stored as NaN.  This is expected — we keep
+       those players using outer/left joins later.
 
 WHAT IS A JOIN / MERGE? (Part B)
     Imagine two spreadsheets that share a column (like "player_name").
@@ -39,29 +44,20 @@ WHAT IS A JOIN / MERGE? (Part B)
         LEFT  → keep every row in the LEFT sheet; fill NaN where no right match
 
 HOW TO USE:
-    from src.data_intake import (
-        SleeperPlayerData, SleeperTeamData, ESPNCombineData, ESPNCollegeData
-    )
-    from src.data_intake.combine import DataCombiner
+    from src.data_intake.combine import ESPNCombineData, DataCombiner
 
-    nfl_df     = SleeperPlayerData().get_player_dataframe()
-    team_df    = SleeperTeamData().get_team_dataframe()
-    combine_df = ESPNCombineData().get_combine_dataframe(years=[2021, 2022, 2023])
-    college_df = ESPNCollegeData().get_college_dataframe(years=[2020, 2021, 2022])
-
+    combine_df = ESPNCombineData().get_combine_dataframe(years=[2023, 2024, 2025])
     master_df  = DataCombiner().merge_all(nfl_df, team_df, combine_df, college_df)
 """
 
 import logging
-import time
 
-import requests
 import pandas as pd
+import nfl_data_py as nfl
 
 from .links import (
-    ESPN_COMBINE_URL,
     CURRENT_NFL_SEASON,
-    REQUEST_TIMEOUT_SECONDS,
+    FANTASY_POSITIONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,12 +65,56 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 # PART A — ESPNCombineData
-#           Fetches NFL Draft Combine athletic measurements from ESPN.
+#           Now powered by nfl_data_py (nflverse) instead of ESPN.
+#           The class name is kept the same so no other files need to change.
 # =============================================================================
+
+# ---------------------------------------------------------------------------
+# COLUMN NAME MAPPING
+# nfl_data_py uses its own column names — we rename them to match
+# the rest of our project's naming convention.
+# ---------------------------------------------------------------------------
+# Format:  nfl_data_py column name  →  our column name
+_COMBINE_COLUMN_MAP = {
+    "player_name"  : "full_name",
+    "pos"          : "position",
+    "school"       : "college",
+    "season"       : "draft_year",       # in combine data, "season" = draft year
+    "ht"           : "height_inches",
+    "wt"           : "weight_lbs",
+    "forty"        : "forty_yard_dash",
+    "vertical"     : "vertical_jump",
+    "bench_reps"   : "bench_press_reps",
+    "broad_jump"   : "broad_jump",
+    "cone"         : "three_cone_drill",
+    "shuttle"      : "twenty_yard_shuttle",
+}
+
+# These are the columns we keep in our final output.
+# Any column not in this list gets dropped.
+_KEEP_COLS = [
+    "draft_year",
+    "full_name",
+    "position",
+    "college",
+    "height_inches",
+    "weight_lbs",
+    "forty_yard_dash",
+    "vertical_jump",
+    "broad_jump",
+    "three_cone_drill",
+    "twenty_yard_shuttle",
+    "bench_press_reps",
+]
+
 
 class ESPNCombineData:
     """
-    Downloads NFL Draft Combine measurements from the (unofficial) ESPN API.
+    Downloads NFL Draft Combine measurements using nfl_data_py (nflverse).
+
+    Despite the name (kept for backward compatibility), this class no longer
+    uses the ESPN API — it uses the nfl_data_py package instead, which
+    downloads cleaned combine data from the nflverse open data project.
 
     One row in the resulting DataFrame = one prospect's measurements
     for one draft year.
@@ -86,158 +126,103 @@ class ESPNCombineData:
     """
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "FantasyFootballRookiePredictor/1.0"})
-        logger.info("ESPNCombineData initialized.")
-
-    def _get(self, url: str) -> dict | list | None:
-        """Makes a GET request and returns parsed JSON, or None on error."""
-        try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.warning("Request failed: %s — %s", url, e)
-            return None
-
-    def _safe_float(self, value) -> float | None:
-        """
-        Converts a value to float safely.
-        Returns None (→ NaN in DataFrame) instead of crashing on bad data.
-
-        WHY None INSTEAD OF 0?
-            0 would imply the player ran the 40-yard dash in 0 seconds,
-            which is impossible and would corrupt our model.
-            NaN (from None) correctly signals "we don't have this data."
-        """
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
-
-    def _fetch_year(self, year: int) -> list[dict]:
-        """Fetches raw combine prospect data for one draft year."""
-        url = ESPN_COMBINE_URL.format(year=year)
-        logger.info("  Fetching combine data for draft year %d…", year)
-        data = self._get(url)
-
-        if data is None:
-            logger.warning("  No combine data returned for %d.", year)
-            return []
-
-        # ESPN wraps prospect data in a nested structure
-        return data.get("athletes", data) if isinstance(data, dict) else data
-
-    def _get_position(self, prospect: dict) -> str | None:
-        """Extracts position abbreviation from a prospect dict."""
-        return prospect.get("athlete", {}).get("position", {}).get("abbreviation")
-
-    def _build_row(self, year: int, prospect: dict) -> dict:
-        """
-        Flattens one prospect's ESPN JSON into a plain dictionary (one row).
-
-        ESPN structure (simplified):
-            {
-                "athlete": {
-                    "id": "...",
-                    "displayName": "Bijan Robinson",
-                    "position": {"abbreviation": "RB"},
-                    "college": {"shortDisplayName": "Texas"}
-                },
-                "results": [
-                    {"name": "40YardDash",  "displayValue": "4.46"},
-                    {"name": "verticalJump","displayValue": "37.5"},
-                    ...
-                ]
-            }
-        """
-        athlete = prospect.get("athlete", {})
-
-        # Convert the results list to a dict for easy lookup
-        results = {
-            r["name"]: r.get("displayValue")
-            for r in prospect.get("results", [])
-            if "name" in r
-        }
-
-        return {
-            # Identity
-            "draft_year"          : year,
-            "espn_athlete_id"     : athlete.get("id"),
-            "full_name"           : athlete.get("displayName", "Unknown"),
-            "position"            : athlete.get("position", {}).get("abbreviation"),
-            "college"             : athlete.get("college", {}).get("shortDisplayName"),
-
-            # Size
-            "height_inches"       : self._safe_float(results.get("height")),
-            "weight_lbs"          : self._safe_float(results.get("weight")),
-
-            # Athletic measurements — None → NaN if player didn't perform test
-            "forty_yard_dash"     : self._safe_float(results.get("40YardDash")),
-            "vertical_jump"       : self._safe_float(results.get("verticalJump")),
-            "broad_jump"          : self._safe_float(results.get("broadJump")),
-            "three_cone_drill"    : self._safe_float(results.get("3ConeDrill")),
-            "twenty_yard_shuttle" : self._safe_float(results.get("20YardShuttle")),
-            "bench_press_reps"    : self._safe_float(results.get("benchPress")),
-        }
+        logger.info("ESPNCombineData initialized (using nfl_data_py / nflverse).")
 
     def get_combine_dataframe(self, years: list[int] | None = None) -> pd.DataFrame:
         """
-        Fetches combine measurements for the given draft years.
+        Fetches combine measurements for the given draft years using nfl_data_py.
 
         PARAMETERS:
-            years : List of draft years to fetch (e.g. [2021, 2022, 2023]).
-                    Defaults to [CURRENT_NFL_SEASON] if not supplied.
+            years (list[int] | None) :
+                Draft years to fetch (e.g. [2023, 2024, 2025]).
+                Defaults to [CURRENT_NFL_SEASON] if not supplied.
 
         RETURNS:
-            pd.DataFrame with one row per prospect.
-            Measurement columns may be NaN — that is expected and normal.
+            pd.DataFrame with one row per prospect who attended the combine.
+            Measurement columns may contain NaN — that is expected and normal.
         """
         if years is None:
             years = [CURRENT_NFL_SEASON]
 
-        rows = [
-            self._build_row(year, p)
-            for year in years
-            for p in self._fetch_year(year)
-        ]
+        logger.info("Fetching combine data for draft years: %s", years)
 
-        if not rows:
-            logger.warning("No combine data — returning empty DataFrame.")
+        # ── Fetch from nfl_data_py ────────────────────────────────────────
+        # nfl_data_py downloads parquet files from GitHub (nflverse project).
+        # This is a single function call that handles all the downloading.
+        try:
+            df = nfl.import_combine_data(years=years)
+        except Exception as e:
+            logger.error("Failed to fetch combine data via nfl_data_py: %s", e)
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows)
+        if df is None or df.empty:
+            logger.warning("nfl_data_py returned no combine data for years: %s", years)
+            return pd.DataFrame()
 
-        # Drop rows where EVERY measurement column is NaN (placeholder entries).
-        # Rows with only PARTIAL data are kept — partial data is still useful.
-        measurement_cols = [
-            "forty_yard_dash", "vertical_jump", "broad_jump",
-            "three_cone_drill", "twenty_yard_shuttle", "bench_press_reps",
-        ]
-        before = len(df)
-        df = df.dropna(subset=measurement_cols, how="all").reset_index(drop=True)
+        logger.info("Raw combine data: %d rows × %d columns.", len(df), len(df.columns))
+
+        # ── Rename columns to our naming convention ───────────────────────
+        # Only rename columns that actually exist — avoids errors if
+        # nfl_data_py changes a column name in a future version.
+        rename_map = {
+            old: new
+            for old, new in _COMBINE_COLUMN_MAP.items()
+            if old in df.columns
+        }
+        df = df.rename(columns=rename_map)
+
+        # ── Filter to fantasy-relevant positions only ──────────────────────
+        # We only care about QB, RB, WR, TE for our prediction model.
+        if "position" in df.columns:
+            before = len(df)
+            df = df[df["position"].isin(FANTASY_POSITIONS)].copy()
+            logger.info(
+                "Position filter: kept %d of %d rows (QB/RB/WR/TE only).",
+                len(df), before,
+            )
+        else:
+            logger.warning("'position' column not found — skipping position filter.")
+
+        # ── Keep only the columns we need ─────────────────────────────────
+        cols_to_keep = [c for c in _KEEP_COLS if c in df.columns]
+        df = df[cols_to_keep].reset_index(drop=True)
+
         logger.info(
-            "Removed %d fully empty rows. Combine DataFrame: %d rows × %d cols.",
-            before - len(df), len(df), len(df.columns),
+            "Combine DataFrame complete: %d rows × %d columns.",
+            len(df), len(df.columns),
         )
         return df
 
 
 # =============================================================================
 # PART B — DataCombiner
-#           Merges (combines) all four DataFrames into one master table.
+#           Merges all four separate DataFrames into one master table.
+#           This class is UNCHANGED — it doesn't care where combine data
+#           came from (ESPN or nfl_data_py), only what columns it has.
 # =============================================================================
 
 class DataCombiner:
     """
-    Joins all four data sources into one master DataFrame.
+    Merges the four separate DataFrames into a single master table.
 
-    ┌─────────────────┐   season + team   ┌──────────────┐
-    │  nfl_df         │ ←────────────────→ │  team_df     │
-    │  (player stats) │                    │  (team stats)│
+    WHY MERGE SEPARATELY INSTEAD OF ALL AT ONCE?
+        Each dataset has different "natural keys" (the columns used to match
+        rows between tables):
+
+            nfl_df     ──→  team_df     via  nfl_team + season
+            │
+            └──────────→  combine_df  via  full_name + college + draft_year
+            │
+            └──────────→  college_df  via  full_name + college + last_college_season
+
+    Doing it in steps makes errors easier to find — if something goes wrong
+    you can see exactly which merge caused the problem.
+
+    DIAGRAM:
+        nfl_df  ←──────── the "spine" (every player-season row is kept)
     └────────┬────────┘                    └──────────────┘
+             │  nfl_team + season
+             ├──────────────────────────→  team_df     (team context)
              │  full_name + college + draft_year
              ├──────────────────────────→  combine_df  (combine measurements)
              │  full_name + college + (draft_year - 1)

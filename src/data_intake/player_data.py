@@ -64,6 +64,20 @@ WHY years_exp AND draft_year MATTER:
         last_college_season = nfl_season - 1
     This is much more accurate, especially for players who redshirted,
     transferred, or came back for an extra college season.
+
+FIX — BATCH RESPONSE FORMAT:
+    The Sleeper batch stats endpoint can return data in two formats
+    depending on the API version:
+
+    Format A (list):
+        [ {"player_id": "4046", "stats": {"pass_yd": 4183, "gp": 17}}, ... ]
+
+    Format B (dict keyed by player_id):
+        { "4046": {"pass_yd": 4183, "gp": 17}, ... }
+
+    The original code only handled Format A.  If the API returns Format B,
+    every player got an empty stats dict → gp=0 → all rows filtered out
+    → 0 rows in the final DataFrame.  This fix handles both formats.
 """
 
 import logging
@@ -175,14 +189,19 @@ class SleeperPlayerData:
                        {
                          "4046": {"pass_yd": 4183, "pass_td": 27, "gp": 17, ...},
                          "2749": {"rec_yd": 1074, "rec_td": 5,   "gp": 17, ...},
-                         ...
                        }
 
-        WHAT IS THE BATCH URL?
-            /stats/nfl/regular/{season}?season_type=regular
-            Returns every player's season totals in one response.
-            Sleeper returns this as a list of objects, each with a
-            "player_id" key and a "stats" key containing the numbers.
+        FORMAT HANDLING:
+            Sleeper's batch endpoint can return either a list or a dict
+            depending on the API version.  We handle both here to be safe.
+
+            Format A (list of objects):
+                [{"player_id": "4046", "stats": {...}}, ...]
+                → we convert this to a dict keyed by player_id
+
+            Format B (dict keyed by player_id, stats inline):
+                {"4046": {"pass_yd": 4183, ...}, ...}
+                → already in the right format, use directly
         """
         url = SLEEPER_BATCH_STATS_URL.format(season=season)
         logger.info("  Fetching batch stats for season %d…", season)
@@ -193,24 +212,57 @@ class SleeperPlayerData:
             logger.warning("  No stats returned for season %d.", season)
             return {}
 
-        # The batch endpoint returns a LIST of objects like:
-        # [{"player_id": "4046", "stats": {"pass_yd": 4183, ...}}, ...]
-        # We convert it to a dict keyed by player_id for fast lookups.
-        #
-        # WHAT IS A DICT COMPREHENSION?
-        #   {key: value for item in list} builds a dictionary in one line.
-        #   Here: for each entry in the list, use player_id as the key
-        #   and the stats sub-dict as the value.
-        stats_by_player = {
-            entry["player_id"]: entry.get("stats", {})
-            for entry in data
-            if "player_id" in entry
-        }
+        # ── Handle Format A: list of {"player_id": ..., "stats": {...}} ──
+        if isinstance(data, list):
+            logger.info(
+                "  Season %d: batch response is a LIST of %d entries.",
+                season, len(data),
+            )
+            stats_by_player = {
+                entry["player_id"]: entry.get("stats", {})
+                for entry in data
+                if isinstance(entry, dict) and "player_id" in entry
+            }
 
-        logger.info(
-            "  Season %d: received stats for %d players.",
-            season, len(stats_by_player)
-        )
+        # ── Handle Format B: dict keyed by player_id ──────────────────
+        elif isinstance(data, dict):
+            logger.info(
+                "  Season %d: batch response is a DICT with %d player entries.",
+                season, len(data),
+            )
+            # Check if values are nested ({"stats": {...}}) or direct dicts
+            sample_val = next(iter(data.values()), None)
+            if isinstance(sample_val, dict) and "stats" in sample_val:
+                # Values are nested: {"player_id": {"stats": {...}}}
+                stats_by_player = {
+                    pid: entry.get("stats", {})
+                    for pid, entry in data.items()
+                }
+            else:
+                # Values are flat stat dicts already: {"player_id": {stat: val}}
+                stats_by_player = data
+
+        # ── Unknown format ─────────────────────────────────────────────
+        else:
+            logger.warning(
+                "  Season %d: unexpected batch response type (%s) — returning empty.",
+                season, type(data).__name__,
+            )
+            return {}
+
+        # Safety check — warn loudly if we got 0 stats after parsing
+        if not stats_by_player:
+            logger.warning(
+                "  Season %d: parsed 0 player stats — "
+                "the API may have returned an unexpected format.",
+                season,
+            )
+        else:
+            logger.info(
+                "  Season %d: received stats for %d players.",
+                season, len(stats_by_player),
+            )
+
         return stats_by_player
 
     def _build_player_row(
@@ -339,7 +391,6 @@ class SleeperPlayerData:
             return pd.DataFrame()
 
         # STEP 2 & 3 — batch stats fetch + row building
-        # Seasons to collect: 2025, 2024, 2023
         seasons = [
             CURRENT_NFL_SEASON - i
             for i in range(NFL_SEASONS_TO_COLLECT)
@@ -352,9 +403,16 @@ class SleeperPlayerData:
             # One API call gets stats for ALL players this season
             season_stats = self._fetch_season_stats_batch(season)
 
+            if not season_stats:
+                logger.warning(
+                    "Season %d returned no stats — rows for this season will "
+                    "all have 0 games_played and will be filtered out.",
+                    season,
+                )
+
             # Match each player's bio info to their stats for this season
             for player_id, info in all_players.items():
-                stats = season_stats.get(player_id, {})   # empty dict if no stats
+                stats = season_stats.get(player_id, {})
                 row   = self._build_player_row(player_id, info, season, stats)
                 rows.append(row)
 
@@ -373,6 +431,14 @@ class SleeperPlayerData:
             "Removed %d rows with 0 games played. %d rows remaining.",
             before - len(df), len(df),
         )
+
+        if len(df) == 0:
+            logger.warning(
+                "DataFrame is empty after filtering!  This usually means "
+                "the batch stats endpoint returned no data.  "
+                "Check the log lines above for 'batch response is a LIST/DICT' "
+                "to confirm whether the API responded correctly."
+            )
 
         # STEP 6 — reset row numbers (0, 1, 2, …) after filtering
         df = df.reset_index(drop=True)

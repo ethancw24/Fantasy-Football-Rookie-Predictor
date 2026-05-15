@@ -3,266 +3,273 @@ data_intake/team_data.py
 ========================
 
 PURPOSE:
-    Fetches NFL team-level statistics from the ESPN API.
-    Team context matters a lot for fantasy football — a great player on a
-    bad offense will score fewer fantasy points than an average player on an
-    elite offense.
+    Fetches NFL team-level statistics and returns them as a DataFrame.
+    One row = one team's stats for one season.
 
-WHY TEAM DATA?
-    Your project idea mentions several team-level factors to consider:
-        Previous season win/loss record
-        Previous season passer rating (how good the QB situation was)
-        Previous season rushing rating
-        Previous season defensive rating
-        Previous season offensive line rating
-        Head coach (coaching stability / offensive scheme)
+WHY WE SWITCHED FROM ESPN:
+    The ESPN hidden API was returning data, but the nested JSON structure
+    didn't match our parsing code — resulting in 96 rows of all-zeros.
+    nfl_data_py (nflverse) provides schedule data that we can use to
+    compute team records and scoring stats reliably.
 
-    When we later combine this with player data, a rookie's fantasy ceiling
-    will be partially predicted by the team they land on.
+WHAT WE GET FROM nfl_data_py SCHEDULES:
+    - Win / loss / tie record per team per season
+    - Win percentage
+    - Points scored per game  (offensive output)
+    - Points allowed per game (defensive quality)
+    - Head coach name (schedules include coach per game)
+    - Home vs away breakdown
+
+WHAT WE DON'T GET (future improvement):
+    - Passer rating, rushing yards per game, defensive yards per game
+      These require play-by-play data (nfl.import_pbp_data) which is
+      much larger and slower to download.  We'll add them in a future stage.
+
+WHY TEAM DATA MATTERS FOR FANTASY FOOTBALL:
+    Your project accounts for several team-level factors:
+        Previous season win/loss record  → team quality indicator
+        Head coach                       → offensive scheme and stability
+        Points per game                  → how often this team scores
+        Points allowed per game          → how aggressive they need to be
+
+    When we join this with player data, a rookie joining a high-scoring
+    team gets a fantasy ceiling boost even before playing a snap.
 
 HOW TO USE:
     fetcher = SleeperTeamData()
-    df = fetcher.get_team_dataframe()
+    df = fetcher.get_team_dataframe(seasons=[2023, 2024, 2025])
     print(df.head())
 """
 
 import logging
-import requests
+
 import pandas as pd
+import nfl_data_py as nfl
 
 from .links import (
-    ESPN_NFL_TEAM_STATS_URL,
     CURRENT_NFL_SEASON,
-    REQUEST_TIMEOUT_SECONDS,
+    NFL_SEASONS_TO_COLLECT,
 )
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# NFL TEAM REFERENCE TABLE
-# ESPN uses numeric IDs for teams, not abbreviations.
-# This dictionary maps ESPN's IDs to human-readable info.
-# We use it so our final DataFrame has readable team names instead of numbers.
+# NFLVERSE → SLEEPER TEAM ABBREVIATION MAP
 # ---------------------------------------------------------------------------
-
-# Format:  espn_team_id : { "abbreviation": ..., "full_name": ..., "conference": ... }
-NFL_TEAMS = {
-    1:  {"abbreviation": "ATL", "full_name": "Atlanta Falcons",        "conference": "NFC"},
-    2:  {"abbreviation": "BUF", "full_name": "Buffalo Bills",          "conference": "AFC"},
-    3:  {"abbreviation": "CHI", "full_name": "Chicago Bears",          "conference": "NFC"},
-    4:  {"abbreviation": "CIN", "full_name": "Cincinnati Bengals",     "conference": "AFC"},
-    5:  {"abbreviation": "CLE", "full_name": "Cleveland Browns",       "conference": "AFC"},
-    6:  {"abbreviation": "DAL", "full_name": "Dallas Cowboys",         "conference": "NFC"},
-    7:  {"abbreviation": "DEN", "full_name": "Denver Broncos",         "conference": "AFC"},
-    8:  {"abbreviation": "DET", "full_name": "Detroit Lions",          "conference": "NFC"},
-    9:  {"abbreviation": "GB",  "full_name": "Green Bay Packers",      "conference": "NFC"},
-    10: {"abbreviation": "TEN", "full_name": "Tennessee Titans",       "conference": "AFC"},
-    11: {"abbreviation": "IND", "full_name": "Indianapolis Colts",     "conference": "AFC"},
-    12: {"abbreviation": "KC",  "full_name": "Kansas City Chiefs",     "conference": "AFC"},
-    13: {"abbreviation": "LV",  "full_name": "Las Vegas Raiders",      "conference": "AFC"},
-    14: {"abbreviation": "LAR", "full_name": "Los Angeles Rams",       "conference": "NFC"},
-    15: {"abbreviation": "MIA", "full_name": "Miami Dolphins",         "conference": "AFC"},
-    16: {"abbreviation": "MIN", "full_name": "Minnesota Vikings",      "conference": "NFC"},
-    17: {"abbreviation": "NE",  "full_name": "New England Patriots",   "conference": "AFC"},
-    18: {"abbreviation": "NO",  "full_name": "New Orleans Saints",     "conference": "NFC"},
-    19: {"abbreviation": "NYG", "full_name": "New York Giants",        "conference": "NFC"},
-    20: {"abbreviation": "NYJ", "full_name": "New York Jets",          "conference": "AFC"},
-    21: {"abbreviation": "PHI", "full_name": "Philadelphia Eagles",    "conference": "NFC"},
-    22: {"abbreviation": "ARI", "full_name": "Arizona Cardinals",      "conference": "NFC"},
-    23: {"abbreviation": "PIT", "full_name": "Pittsburgh Steelers",    "conference": "AFC"},
-    24: {"abbreviation": "LAC", "full_name": "Los Angeles Chargers",   "conference": "AFC"},
-    25: {"abbreviation": "SF",  "full_name": "San Francisco 49ers",    "conference": "NFC"},
-    26: {"abbreviation": "SEA", "full_name": "Seattle Seahawks",       "conference": "NFC"},
-    27: {"abbreviation": "TB",  "full_name": "Tampa Bay Buccaneers",   "conference": "NFC"},
-    28: {"abbreviation": "WAS", "full_name": "Washington Commanders",  "conference": "NFC"},
-    29: {"abbreviation": "CAR", "full_name": "Carolina Panthers",      "conference": "NFC"},
-    30: {"abbreviation": "JAX", "full_name": "Jacksonville Jaguars",   "conference": "AFC"},
-    33: {"abbreviation": "BAL", "full_name": "Baltimore Ravens",       "conference": "AFC"},
-    34: {"abbreviation": "HOU", "full_name": "Houston Texans",         "conference": "AFC"},
+# nfl_data_py uses nflverse abbreviations.  Sleeper uses slightly different
+# ones for some teams.  This map normalises them so our team merge works.
+#
+# Add more entries here if you notice team names not matching in the merge.
+# ---------------------------------------------------------------------------
+NFLVERSE_TO_SLEEPER = {
+    "LA"  : "LAR",   # Los Angeles Rams (nflverse uses "LA", Sleeper uses "LAR")
+    "JAC" : "JAX",   # Jacksonville Jaguars
+    "OAK" : "LV",    # Oakland Raiders → now Las Vegas Raiders
+    "SD"  : "LAC",   # San Diego Chargers → now Los Angeles Chargers
+    "STL" : "LAR",   # St. Louis Rams → now Los Angeles Rams
 }
+
+
+def _normalize_team(abbr: str) -> str:
+    """
+    Converts an nflverse team abbreviation to its Sleeper equivalent.
+    If the abbreviation isn't in the map, it's returned unchanged.
+    """
+    return NFLVERSE_TO_SLEEPER.get(abbr, abbr)
 
 
 class SleeperTeamData:
     """
-    Collects NFL team statistics from the ESPN API.
+    Collects NFL team statistics using nfl_data_py (nflverse) schedule data.
 
     Each row in the resulting DataFrame represents one team for one season,
-    with columns for win/loss record, offensive ratings, defensive ratings,
-    and head coach information.
+    with columns for win/loss record, scoring, and head coach.
+
+    Note: The class is named SleeperTeamData for historical reasons — it
+    no longer uses the Sleeper API for team stats, but the name is kept
+    to avoid changing other files.
     """
 
     def __init__(self):
-        """
-        Set up the HTTP session and log that we're ready.
-        """
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "FantasyFootballRookiePredictor/1.0"})
-        logger.info("SleeperTeamData initialized.")
+        logger.info("SleeperTeamData initialized (using nfl_data_py schedules).")
 
-    def _get(self, url: str) -> dict | list | None:
+    def _compute_team_records(
+        self,
+        schedules : pd.DataFrame,
+        seasons   : list[int],
+    ) -> pd.DataFrame:
         """
-        Makes a single HTTP GET request and returns parsed JSON.
-        Handles errors gracefully so one bad call doesn't crash everything.
-        """
-        try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.Timeout:
-            logger.error("Timeout fetching: %s", url)
-        except requests.exceptions.HTTPError as err:
-            logger.error("HTTP error: %s — %s", url, err)
-        except requests.exceptions.RequestException as err:
-            logger.error("Network error: %s — %s", url, err)
-        return None
+        Computes win/loss/tie record, scoring stats, and head coach
+        for every team in every season from the schedule DataFrame.
 
-    def _extract_stat(self, stats_list: list, stat_name: str) -> float:
-        """
-        ESPN returns stats as a list of objects.  This helper searches that
-        list for a specific stat by name and returns its numeric value.
+        HOW THIS WORKS:
+            nfl_data_py schedules have one row per GAME, with both
+            home_team and away_team.  For each game we need to give
+            credit to BOTH teams — the winner gets a W and the loser gets an L.
 
-        EXAMPLE ESPN stats_list item:
-            {"name": "passerRating", "displayValue": "103.4", "value": 103.4}
+            We do this by building two views of the same game:
+                - home team view: home_team is "our team", away_team is opponent
+                - away team view: away_team is "our team", home_team is opponent
+
+            Then we stack both views, group by (team, season), and sum up
+            wins, losses, ties, points scored, and points allowed.
 
         PARAMETERS:
-            stats_list (list) : The list of stat objects from ESPN.
-            stat_name  (str)  : The "name" field we're looking for.
-
-        RETURNS:
-            float : The numeric value, or 0.0 if not found.
-        """
-        for stat in stats_list:
-            if stat.get("name") == stat_name:
-                return float(stat.get("value", 0.0))
-        return 0.0   # stat not found — treat as 0
-
-    def _fetch_team_season(self, team_id: int, season: int) -> dict | None:
-        """
-        Fetches raw data for one team for one season from ESPN.
-
-        PARAMETERS:
-            team_id (int) : ESPN's numeric team ID.
-            season  (int) : The season year (e.g. 2023).
-
-        RETURNS:
-            The raw JSON dict from ESPN, or None on failure.
-        """
-        url = ESPN_NFL_TEAM_STATS_URL.format(year=season, team_id=team_id)
-        return self._get(url)
-
-    def _build_team_row(self, team_id: int, season: int, data: dict) -> dict:
-        """
-        Parses raw ESPN JSON for one team-season into a flat row dictionary.
-
-        PARAMETERS:
-            team_id (int)  : ESPN team ID.
-            season  (int)  : Season year.
-            data    (dict) : Raw JSON from ESPN.
-
-        RETURNS:
-            dict : One row ready to go into the DataFrame.
-        """
-        # Look up our human-readable team info from our reference table above.
-        team_ref  = NFL_TEAMS.get(team_id, {})
-
-        # ESPN nests stats inside "team" → "record" and "team" → "stats"
-        team_info = data.get("team", {})
-        record    = team_info.get("record", {}).get("items", [{}])[0]
-        stats     = team_info.get("stats", {}).get("splits", [{}])[0].get("stats", [])
-
-        # Parse win/loss record from the record object.
-        # ESPN gives these as strings like "11", so we convert to int.
-        wins   = int(record.get("wins",   0))
-        losses = int(record.get("losses", 0))
-        ties   = int(record.get("ties",   0))
-        games  = wins + losses + ties
-
-        return {
-            # ── Identity ──────────────────────────────────────────────────
-            "team_id"           : team_id,
-            "season"            : season,
-            "team_abbreviation" : team_ref.get("abbreviation", f"ID_{team_id}"),
-            "team_full_name"    : team_ref.get("full_name",    f"Team {team_id}"),
-            "conference"        : team_ref.get("conference"),
-
-            # ── Win / Loss record ─────────────────────────────────────────
-            "wins"              : wins,
-            "losses"            : losses,
-            "ties"              : ties,
-            # Win percentage = wins / total games played (0.0 – 1.0)
-            "win_pct"           : round(wins / games, 3) if games > 0 else 0.0,
-
-            # ── Offensive ratings ─────────────────────────────────────────
-            # Passer rating measures QB efficiency (0–158.3 scale in NFL)
-            "passer_rating"     : self._extract_stat(stats, "passerRating"),
-            # Points scored per game — higher = better offense
-            "points_per_game"   : self._extract_stat(stats, "pointsPerGame"),
-            # Total offensive yards gained per game
-            "yards_per_game_off": self._extract_stat(stats, "totalYardsPerGame"),
-            # Rushing yards per game
-            "rush_yards_per_game" : self._extract_stat(stats, "rushingYardsPerGame"),
-            # Passing yards per game
-            "pass_yards_per_game" : self._extract_stat(stats, "passingYardsPerGame"),
-
-            # ── Defensive ratings ─────────────────────────────────────────
-            # Points allowed per game — lower = better defense
-            "points_allowed_per_game" : self._extract_stat(stats, "pointsAllowedPerGame"),
-            # Total yards allowed per game — lower = better defense
-            "yards_allowed_per_game"  : self._extract_stat(stats, "totalYardsAllowedPerGame"),
-            # Sacks generated — higher means the D-line creates more pressure
-            "sacks"                   : self._extract_stat(stats, "sacks"),
-
-            # ── Coaching (useful for predicting rookie success) ───────────
-            # Head coach's name — if they changed coaches, a new scheme
-            # could mean unpredictable fantasy output.
-            "head_coach"        : team_info.get("headCoach", {}).get("displayName", "Unknown"),
-        }
-
-    def get_team_dataframe(self, seasons: list[int] | None = None) -> pd.DataFrame:
-        """
-        Collects team data for all 32 NFL teams across the given seasons.
-
-        PARAMETERS:
-            seasons (list[int] | None) :
-                List of season years to fetch (e.g. [2023, 2022, 2021]).
-                If None, defaults to [CURRENT_NFL_SEASON].
+            schedules (pd.DataFrame) : Schedule data from nfl.import_schedules().
+            seasons   (list[int])    : Which seasons to include.
 
         RETURNS:
             pd.DataFrame : One row per team-season.
-
-        EXAMPLE:
-            fetcher = SleeperTeamData()
-            df = fetcher.get_team_dataframe(seasons=[2023, 2022])
         """
-        if seasons is None:
-            seasons = [CURRENT_NFL_SEASON]
+        # Filter to regular season only (game_type == 'REG')
+        # We don't want playoff wins inflating a team's record.
+        reg_season = schedules[
+            (schedules["season"].isin(seasons)) &
+            (schedules["game_type"] == "REG")
+        ].copy()
+
+        if reg_season.empty:
+            logger.warning("No regular season games found for seasons: %s", seasons)
+            return pd.DataFrame()
+
+        # Drop rows where either score is missing (game not yet played)
+        reg_season = reg_season.dropna(subset=["home_score", "away_score"])
 
         rows = []
 
         for season in seasons:
-            logger.info("Fetching team data for the %d season…", season)
+            season_games = reg_season[reg_season["season"] == season]
 
-            for team_id, team_ref in NFL_TEAMS.items():
-                data = self._fetch_team_season(team_id, season)
+            if season_games.empty:
+                logger.warning("No completed games found for season %d.", season)
+                continue
 
-                if data is None:
-                    # Log the skip but keep going — one bad team shouldn't stop all others.
-                    logger.warning(
-                        "Skipping %s (%d) — no data returned.",
-                        team_ref["abbreviation"], season
-                    )
-                    continue
+            # Get all unique teams that played in this season
+            home_teams = set(season_games["home_team"].dropna())
+            away_teams = set(season_games["away_team"].dropna())
+            all_teams  = home_teams | away_teams   # union of both sets
 
-                row = self._build_team_row(team_id, season, data)
-                rows.append(row)
+            for raw_team in sorted(all_teams):
+                # Normalize the abbreviation to match Sleeper's format
+                team = _normalize_team(raw_team)
 
-        if not rows:
-            logger.error("No team data collected — returning empty DataFrame.")
+                # ── Home games ───────────────────────────────────────────
+                home_games = season_games[season_games["home_team"] == raw_team]
+                home_wins  = (home_games["home_score"] > home_games["away_score"]).sum()
+                home_losses= (home_games["home_score"] < home_games["away_score"]).sum()
+                home_ties  = (home_games["home_score"] == home_games["away_score"]).sum()
+                home_scored   = home_games["home_score"].sum()
+                home_allowed  = home_games["away_score"].sum()
+
+                # ── Away games ───────────────────────────────────────────
+                away_games = season_games[season_games["away_team"] == raw_team]
+                away_wins  = (away_games["away_score"] > away_games["home_score"]).sum()
+                away_losses= (away_games["away_score"] < away_games["home_score"]).sum()
+                away_ties  = (away_games["away_score"] == away_games["home_score"]).sum()
+                away_scored  = away_games["away_score"].sum()
+                away_allowed = away_games["home_score"].sum()
+
+                # ── Totals ───────────────────────────────────────────────
+                wins   = int(home_wins   + away_wins)
+                losses = int(home_losses + away_losses)
+                ties   = int(home_ties   + away_ties)
+                games  = wins + losses + ties
+                total_scored  = home_scored  + away_scored
+                total_allowed = home_allowed + away_allowed
+
+                # ── Head coach ───────────────────────────────────────────
+                # nfl_data_py schedules include the home and away coach per game.
+                # We take the most common coach listed for this team — handles
+                # mid-season coaching changes by picking the majority.
+                #
+                # home_coach column: coach for the home team that game
+                # away_coach column: coach for the away team that game
+                home_coaches = home_games["home_coach"].dropna()
+                away_coaches = away_games["away_coach"].dropna()
+                all_coaches  = pd.concat([home_coaches, away_coaches])
+
+                if all_coaches.empty:
+                    head_coach = "Unknown"
+                else:
+                    # mode() returns the most frequent value(s)
+                    head_coach = all_coaches.mode().iloc[0]
+
+                rows.append({
+                    # ── Identity ─────────────────────────────────────────
+                    "nfl_team" : team,
+                    "season"   : season,
+
+                    # ── Win / Loss record ─────────────────────────────────
+                    "wins"     : wins,
+                    "losses"   : losses,
+                    "ties"     : ties,
+                    "win_pct"  : round(wins / games, 3) if games > 0 else 0.0,
+
+                    # ── Scoring ───────────────────────────────────────────
+                    # Points per game — how productive the offense was
+                    "points_per_game" : round(total_scored  / games, 1) if games > 0 else 0.0,
+                    # Points allowed per game — lower = better defense
+                    "points_allowed_per_game" : round(total_allowed / games, 1) if games > 0 else 0.0,
+
+                    # ── Coaching ──────────────────────────────────────────
+                    "head_coach" : head_coach,
+
+                    # ── Advanced stats (not yet available) ────────────────
+                    # These require play-by-play data — future improvement.
+                    "passer_rating"      : None,
+                    "rush_yards_per_game": None,
+                    "pass_yards_per_game": None,
+                })
+
+        return pd.DataFrame(rows)
+
+    def get_team_dataframe(self, seasons: list[int] | None = None) -> pd.DataFrame:
+        """
+        Collects team records and scoring stats for the given seasons.
+
+        PARAMETERS:
+            seasons (list[int] | None) :
+                List of season years (e.g. [2023, 2024, 2025]).
+                Defaults to the last NFL_SEASONS_TO_COLLECT seasons.
+
+        RETURNS:
+            pd.DataFrame : One row per team-season.
+        """
+        if seasons is None:
+            seasons = [
+                CURRENT_NFL_SEASON - i
+                for i in range(NFL_SEASONS_TO_COLLECT)
+            ]
+
+        logger.info("Fetching NFL team data for seasons: %s", seasons)
+
+        # Download schedule data from nfl_data_py.
+        # import_schedules() fetches a parquet file from the nflverse project.
+        # It includes every game (regular season + playoffs) for the given years.
+        try:
+            schedules = nfl.import_schedules(years=seasons)
+        except Exception as e:
+            logger.error("Failed to fetch schedules via nfl_data_py: %s", e)
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows).reset_index(drop=True)
+        if schedules is None or schedules.empty:
+            logger.error("nfl_data_py returned no schedule data.")
+            return pd.DataFrame()
+
+        logger.info(
+            "Raw schedule data: %d games across %d seasons.",
+            len(schedules), len(seasons),
+        )
+
+        df = self._compute_team_records(schedules, seasons)
+
+        if df.empty:
+            logger.error("No team records computed — returning empty DataFrame.")
+            return pd.DataFrame()
+
+        df = df.reset_index(drop=True)
         logger.info(
             "Team DataFrame complete: %d rows × %d columns.",
-            len(df), len(df.columns)
+            len(df), len(df.columns),
         )
         return df
