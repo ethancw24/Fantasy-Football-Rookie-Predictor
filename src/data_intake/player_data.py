@@ -1,120 +1,450 @@
+"""
+data_intake/player_data.py
+==========================
+
+PURPOSE:
+    Fetches NFL player stats from the Sleeper API and returns them as a
+    clean pandas DataFrame.  One row = one player's stats for one season.
+
+WHAT IS THE SLEEPER API?
+    Sleeper is a free fantasy football platform.  Their API is completely
+    free and does not require an API key.  It provides:
+        - A full list of all NFL players (bio info, team, college, etc.)
+        - Season-by-season stats for every player
+
+API DOCS:
+    https://docs.sleeper.com/
+
+HOW TO USE THIS FILE:
+    from src.data_intake.player_data import SleeperPlayerData
+
+    fetcher = SleeperPlayerData()
+    df = fetcher.get_player_dataframe()
+
+    print(df.head())           # peek at the first 5 rows
+    print(df.columns.tolist()) # see every column name
+
+COLUMNS PRODUCED (key ones):
+    player_id         — Sleeper's unique ID for each player
+    full_name         — e.g. "Patrick Mahomes"
+    position          — QB / RB / WR / TE
+    nfl_team          — e.g. "KC"
+    college           — e.g. "Texas Tech"
+    age               — player's age at time of data pull
+    years_exp         — how many NFL seasons the player has completed
+                        (0 = current rookie, 1 = second year, etc.)
+    draft_year        — the year they were drafted / entered the NFL
+                        calculated as: CURRENT_NFL_SEASON - years_exp
+    season            — the NFL season year (e.g. 2025)
+    games_played      — how many games played that season
+    pass_yards, rush_yards, rec_yards, etc. — season stats
+    fantasy_pts_*     — fantasy points in standard / half-PPR / PPR formats
+
+WHY BATCH FETCHING?
+    The original approach made one API call per player per season.
+    With 2,896 players × 3 seasons = ~8,700 requests — that took 50+ minutes.
+
+    The batch endpoint returns ALL players' stats for an entire season
+    in a single API call.  3 seasons = just 3 requests.
+    Runtime drops from 50+ minutes to under 1 minute.
+
+    OLD URL (one player at a time):
+        /stats/nfl/player/{player_id}?season_type=regular&season=2025
+
+    NEW URL (all players at once):
+        /stats/nfl/regular/2025?season_type=regular
+
+WHY years_exp AND draft_year MATTER:
+    When we later match NFL players to their college stats, we need to know
+    which college season to look up.  A player drafted in 2022 played their
+    last college season in 2021.
+    Having draft_year stored here lets data_cleaning use:
+        last_college_season = draft_year - 1
+    ...instead of the rougher approximation:
+        last_college_season = nfl_season - 1
+    This is much more accurate, especially for players who redshirted,
+    transferred, or came back for an extra college season.
+
+FIX — BATCH RESPONSE FORMAT:
+    The Sleeper batch stats endpoint can return data in two formats
+    depending on the API version:
+
+    Format A (list):
+        [ {"player_id": "4046", "stats": {"pass_yd": 4183, "gp": 17}}, ... ]
+
+    Format B (dict keyed by player_id):
+        { "4046": {"pass_yd": 4183, "gp": 17}, ... }
+
+    The original code only handled Format A.  If the API returns Format B,
+    every player got an empty stats dict → gp=0 → all rows filtered out
+    → 0 rows in the final DataFrame.  This fix handles both formats.
+"""
+
+import logging
+
 import requests
 import pandas as pd
-import os
 
-"""
-Set the directory retrival to source out to data/raw
-"""
-DATA_DIR = os.path.join("data", "raw")
-os.makedirs(DATA_DIR, exist_ok=True)
+from .links import (
+    SLEEPER_PLAYERS_URL,
+    SLEEPER_BATCH_STATS_URL,
+    CURRENT_NFL_SEASON,
+    NFL_SEASONS_TO_COLLECT,
+    FANTASY_POSITIONS,
+    REQUEST_TIMEOUT_SECONDS,
+)
 
-def get_rookies(year: int) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# LOGGING SETUP
+# ---------------------------------------------------------------------------
+# logging lets us print progress messages without using print().
+# It's preferred in real projects because you can control the level of detail
+# (DEBUG, INFO, WARNING, ERROR) and redirect output to a file if needed.
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+class SleeperPlayerData:
     """
-    Retrieve rookie player information from the Sleeper API.
+    Collects NFL player stats from the Sleeper API using batch requests.
 
-    This function queries Sleeper's NFL player endpoint and extracts data for players
-    who are rookies (college_exp == 0) and play in one of the key fantasy positions:
-    Quarterback (QB), Running Back (RB), Wide Receiver (WR), or Tight End (TE).
+    Instead of fetching stats one player at a time (slow), this class
+    fetches ALL players' stats for a full season in a single API call (fast).
 
-    The resulting dataset includes each player's unique ID, full name, position,
-    NFL team (if assigned), college name, and college experience level.
-
-    Returns:
-        pd.DataFrame: A DataFrame containing the filtered rookie player data.
-
-    Example:
-        df = get_rookies()
-        df.head()
-        player_id       full_name        position   team    college    years_exp
-        0   123456789   John Smith       WR         LAR     Alabama            0
-        1   987654321   Mike Jones       RB         KC      Clemson            0
+    HOW TO USE THIS CLASS:
+        fetcher = SleeperPlayerData()
+        df = fetcher.get_player_dataframe()
     """
-    url = "https://api.sleeper.app/v1/players/nfl"
-    response = requests.get(url)
-    response.raise_for_status()  # Raises HTTPError if request fails
-    data = response.json()
 
-    valid_positions = {"QB", "RB", "WR", "TE"}
+    def __init__(self):
+        """
+        Sets up a persistent HTTP session for efficient API calls.
 
-    rookies = [
-        {
-            "player_id": pid,
-            "full_name": player.get("full_name"),
-            "position": player.get("position"),
-            "team": player.get("team"),
-            "college": player.get("college"),
-            "years_exp": player.get("years_exp"),
+        A requests.Session reuses the same connection for multiple calls.
+        This is faster and more polite than creating a new connection each time.
+        """
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "FantasyFootballRookiePredictor/1.0"})
+        logger.info("SleeperPlayerData initialized — ready to fetch.")
+
+    # -----------------------------------------------------------------------
+    # PRIVATE HELPER METHODS
+    # -----------------------------------------------------------------------
+
+    def _get(self, url: str) -> dict | list | None:
+        """
+        Makes a single GET request and returns parsed JSON, or None on error.
+
+        WHAT IS JSON?
+            JSON (JavaScript Object Notation) looks like a Python dictionary.
+            requests automatically converts JSON text into a Python dict/list
+            via response.json().
+        """
+        try:
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.Timeout:
+            logger.warning("Request timed out: %s", url)
+        except requests.exceptions.HTTPError as e:
+            logger.warning("HTTP error for %s — %s", url, e)
+        except requests.exceptions.RequestException as e:
+            logger.warning("Request failed for %s — %s", url, e)
+
+        return None
+
+    def _fetch_all_players(self) -> dict:
+        """
+        Downloads the full Sleeper player database — bio info for every
+        NFL player (name, position, team, college, age, years_exp, etc.)
+
+        RETURNS:
+            dict : Keys are player_id strings, values are player info dicts.
+        """
+        logger.info("Downloading full Sleeper player list…")
+        data = self._get(SLEEPER_PLAYERS_URL)
+
+        if data is None:
+            logger.error("Failed to fetch player list — returning empty dict.")
+            return {}
+
+        logger.info("Downloaded %d total players.", len(data))
+        return data
+
+    def _fetch_season_stats_batch(self, season: int) -> dict:
+        """
+        Downloads stats for ALL NFL players for one full season in a
+        single API call.
+
+        This is the key performance improvement over the old approach.
+        Instead of one request per player, we get everyone at once.
+
+        PARAMETERS:
+            season (int) : The NFL season year (e.g. 2025).
+
+        RETURNS:
+            dict : Keys are player_id strings, values are stats dicts.
+                   Example:
+                       {
+                         "4046": {"pass_yd": 4183, "pass_td": 27, "gp": 17, ...},
+                         "2749": {"rec_yd": 1074, "rec_td": 5,   "gp": 17, ...},
+                       }
+
+        FORMAT HANDLING:
+            Sleeper's batch endpoint can return either a list or a dict
+            depending on the API version.  We handle both here to be safe.
+
+            Format A (list of objects):
+                [{"player_id": "4046", "stats": {...}}, ...]
+                → we convert this to a dict keyed by player_id
+
+            Format B (dict keyed by player_id, stats inline):
+                {"4046": {"pass_yd": 4183, ...}, ...}
+                → already in the right format, use directly
+        """
+        url = SLEEPER_BATCH_STATS_URL.format(season=season)
+        logger.info("  Fetching batch stats for season %d…", season)
+
+        data = self._get(url)
+
+        if data is None:
+            logger.warning("  No stats returned for season %d.", season)
+            return {}
+
+        # ── Handle Format A: list of {"player_id": ..., "stats": {...}} ──
+        if isinstance(data, list):
+            logger.info(
+                "  Season %d: batch response is a LIST of %d entries.",
+                season, len(data),
+            )
+            stats_by_player = {
+                entry["player_id"]: entry.get("stats", {})
+                for entry in data
+                if isinstance(entry, dict) and "player_id" in entry
+            }
+
+        # ── Handle Format B: dict keyed by player_id ──────────────────
+        elif isinstance(data, dict):
+            logger.info(
+                "  Season %d: batch response is a DICT with %d player entries.",
+                season, len(data),
+            )
+            # Check if values are nested ({"stats": {...}}) or direct dicts
+            sample_val = next(iter(data.values()), None)
+            if isinstance(sample_val, dict) and "stats" in sample_val:
+                # Values are nested: {"player_id": {"stats": {...}}}
+                stats_by_player = {
+                    pid: entry.get("stats", {})
+                    for pid, entry in data.items()
+                }
+            else:
+                # Values are flat stat dicts already: {"player_id": {stat: val}}
+                stats_by_player = data
+
+        # ── Unknown format ─────────────────────────────────────────────
+        else:
+            logger.warning(
+                "  Season %d: unexpected batch response type (%s) — returning empty.",
+                season, type(data).__name__,
+            )
+            return {}
+
+        # Safety check — warn loudly if we got 0 stats after parsing
+        if not stats_by_player:
+            logger.warning(
+                "  Season %d: parsed 0 player stats — "
+                "the API may have returned an unexpected format.",
+                season,
+            )
+        else:
+            logger.info(
+                "  Season %d: received stats for %d players.",
+                season, len(stats_by_player),
+            )
+
+        return stats_by_player
+
+    def _build_player_row(
+        self,
+        player_id : str,
+        info      : dict,
+        season    : int,
+        stats     : dict,
+    ) -> dict:
+        """
+        Combines one player's bio info + one season's stats into a single
+        flat dictionary — one row in our final DataFrame.
+
+        PARAMETERS:
+            player_id (str)  : Sleeper player ID.
+            info      (dict) : Player bio info (name, team, college, etc.).
+            season    (int)  : The season year.
+            stats     (dict) : The stats dictionary from the batch response.
+
+        RETURNS:
+            dict : One row ready to be added to our DataFrame.
+
+        WHAT IS .get(key, default)?
+            dict.get("key", default_value) returns the value if the key exists,
+            otherwise returns default_value instead of crashing.
+            We use 0 as the default for numeric stats (missing = not played).
+
+        ABOUT years_exp AND draft_year:
+            Sleeper stores "years_exp" directly on every player record.
+                0 = current rookie
+                1 = second-year player
+                7 = seven years of experience
+            We calculate: draft_year = CURRENT_NFL_SEASON - years_exp
+
+            EXAMPLE:
+                Patrick Mahomes, years_exp = 8 in 2025
+                draft_year = 2025 - 8 = 2017  ✓
+        """
+        # ── Calculate draft year from years_exp ───────────────────────────
+        # years_exp may be None for some players (missing data).
+        # We store None → NaN rather than guessing.
+        years_exp  = info.get("years_exp")
+        draft_year = (
+            CURRENT_NFL_SEASON - years_exp
+            if years_exp is not None
+            else None
+        )
+
+        return {
+            # ── Identity ──────────────────────────────────────────────────
+            "player_id"            : player_id,
+            "season"               : season,
+            "full_name"            : info.get("full_name", "Unknown"),
+            "position"             : info.get("position"),
+            "nfl_team"             : info.get("team"),
+            "college"              : info.get("college"),
+            "age"                  : info.get("age"),
+
+            # ── Experience & draft info ───────────────────────────────────
+            "years_exp"            : years_exp,
+            "draft_year"           : draft_year,
+
+            # ── Passing stats (QBs) ───────────────────────────────────────
+            "pass_attempts"        : stats.get("pass_att", 0),
+            "pass_completions"     : stats.get("pass_cmp", 0),
+            "pass_yards"           : stats.get("pass_yd",  0),
+            "pass_touchdowns"      : stats.get("pass_td",  0),
+            "interceptions"        : stats.get("pass_int", 0),
+            "completion_pct"       : (
+                round(stats.get("pass_cmp", 0) / stats.get("pass_att", 1) * 100, 1)
+                if stats.get("pass_att", 0) > 0 else 0.0
+            ),
+
+            # ── Rushing stats (RBs + mobile QBs) ─────────────────────────
+            "rush_attempts"        : stats.get("rush_att", 0),
+            "rush_yards"           : stats.get("rush_yd",  0),
+            "rush_touchdowns"      : stats.get("rush_td",  0),
+            "yards_per_carry"      : (
+                round(stats.get("rush_yd", 0) / stats.get("rush_att", 1), 2)
+                if stats.get("rush_att", 0) > 0 else 0.0
+            ),
+
+            # ── Receiving stats (WRs, TEs, pass-catching RBs) ────────────
+            "targets"              : stats.get("rec_tgt", 0),
+            "receptions"           : stats.get("rec",     0),
+            "rec_yards"            : stats.get("rec_yd",  0),
+            "rec_touchdowns"       : stats.get("rec_td",  0),
+            "yards_per_rec"        : (
+                round(stats.get("rec_yd", 0) / stats.get("rec", 1), 2)
+                if stats.get("rec", 0) > 0 else 0.0
+            ),
+
+            # ── Fantasy points ────────────────────────────────────────────
+            "fantasy_pts_standard" : stats.get("pts_std",      0.0),
+            "fantasy_pts_half_ppr" : stats.get("pts_half_ppr", 0.0),
+            "fantasy_pts_ppr"      : stats.get("pts_ppr",      0.0),
+
+            # ── Games played ──────────────────────────────────────────────
+            # Used to compute per-game averages and flag injury seasons.
+            "games_played"         : stats.get("gp", 0),
         }
-        for pid, player in data.items()
-        if player.get("years_exp") == 0 and player.get("position") in valid_positions
-    ]
 
-    df = pd.DataFrame(rookies)
-    output_path = os.path.join(DATA_DIR, "rookies_{year}.csv")
-    df.to_csv(output_path, index=False)
+    # -----------------------------------------------------------------------
+    # PUBLIC METHOD
+    # -----------------------------------------------------------------------
 
-    print(f"Saved {len(df)} rookies (QB, RB, WR, TE) to rookies_{year}.csv")
-    return df
+    def get_player_dataframe(self) -> pd.DataFrame:
+        """
+        Runs the full data collection pipeline and returns a DataFrame.
 
-def get_team_offensive_stats(year: int) -> pd.DataFrame:
-    """
-    Retrieve NFL team offensive statistics from the Sleeper API for a given year.
+        STEPS:
+            1. Download the full Sleeper player list (bio info).
+            2. For each season, fetch ALL players' stats in one batch call.
+            3. Match bio info to stats and build one row per player-season.
+            4. Filter to fantasy-relevant positions only (QB/RB/WR/TE).
+            5. Drop rows with 0 games played (inactive that season).
+            6. Return the final DataFrame.
 
-    This function queries the Sleeper API's regular season statistics endpoint and
-    extracts team-level offensive performance metrics. The retrieved data includes
-    overall offense rankings as well as specific passing, rushing, and receiving
-    category rankings, along with total touchdowns and red zone efficiency.
+        RETURNS:
+            pd.DataFrame : One row per player-season.
+        """
+        # STEP 1 — player bio info
+        all_players = self._fetch_all_players()
+        if not all_players:
+            logger.error("No players fetched — returning empty DataFrame.")
+            return pd.DataFrame()
 
-    Args:
-        year (int): The NFL season year to retrieve statistics for (e.g., 2024).
+        # STEP 2 & 3 — batch stats fetch + row building
+        seasons = [
+            CURRENT_NFL_SEASON - i
+            for i in range(NFL_SEASONS_TO_COLLECT)
+        ]
+        logger.info("Collecting seasons: %s", seasons)
 
-    Returns:
-        pd.DataFrame: A DataFrame containing team offensive statistics with the following columns:
-            - team (str): Team abbreviation (e.g., "KC", "BUF")
-            - year (int): Year of the stats
-            - offense_rank (int): Overall offense rank
-            - pass_yards_rank (int): Rank by passing yards
-            - pass_td_rank (int): Rank by passing touchdowns
-            - rush_yards_rank (int): Rank by rushing yards
-            - rush_td_rank (int): Rank by rushing touchdowns
-            - rec_yards_rank (int): Rank by receiving yards
-            - rec_td_rank (int): Rank by receiving touchdowns
-            - team_td (int): Total team touchdowns
-            - redzone_rank (int): Team's rank in red zone performance
-            - redzone_pct (float): Red zone touchdown percentage
+        rows = []
 
-    Example:
-        df = get_team_offensive_stats(2024)
-        df.head()
-             team  year  offense_rank  pass_yards_rank  pass_td_rank  ...
-        0     KC  2024             2               3               1
-        1     BUF 2024             4               5               2
-    """
-    url = f"https://api.sleeper.app/v1/stats/nfl/regular/{year}"
-    response = requests.get(url)
-    response.raise_for_status()  # Raises HTTPError if request fails
-    data = response.json()
+        for season in seasons:
+            # One API call gets stats for ALL players this season
+            season_stats = self._fetch_season_stats_batch(season)
 
-    team_stats = [
-        {
-            "team": team,
-            "year": year,
-            "offense_rank": stats.get("offense_rank"),
-            "pass_yards_rank": stats.get("pass_yds_rank"),
-            "pass_td_rank": stats.get("pass_td_rank"),
-            "rush_yards_rank": stats.get("rush_yds_rank"),
-            "rush_td_rank": stats.get("rush_td_rank"),
-            "rec_yards_rank": stats.get("rec_yds_rank"),
-            "rec_td_rank": stats.get("rec_td_rank"),
-            "team_td": stats.get("td"),
-            "redzone_rank": stats.get("redzone_rank"),
-            "redzone_pct": stats.get("redzone_pct"),
-        }
-        for team, stats in data.items()
-        if isinstance(stats, dict)
-    ]
+            if not season_stats:
+                logger.warning(
+                    "Season %d returned no stats — rows for this season will "
+                    "all have 0 games_played and will be filtered out.",
+                    season,
+                )
 
-    df = pd.DataFrame(team_stats)
-    df.to_csv(os.path.join(DATA_DIR, f"sleeper_team_stats_{year}.csv"), index=False)
-    print(f"Saved team offensive stats for {year}")
-    return df
+            # Match each player's bio info to their stats for this season
+            for player_id, info in all_players.items():
+                stats = season_stats.get(player_id, {})
+                row   = self._build_player_row(player_id, info, season, stats)
+                rows.append(row)
+
+        # STEP 4 — convert to DataFrame and filter to fantasy positions
+        df = pd.DataFrame(rows)
+
+        # Keep only QB/RB/WR/TE — isin() checks if a value is in a list
+        df = df[df["position"].isin(FANTASY_POSITIONS)].copy()
+        logger.info("Filtered to %d fantasy-position player-season rows.", len(df))
+
+        # STEP 5 — drop rows where the player had 0 games played that season
+        # (on a roster but never took the field — not useful for the model)
+        before = len(df)
+        df = df[df["games_played"] > 0].copy()
+        logger.info(
+            "Removed %d rows with 0 games played. %d rows remaining.",
+            before - len(df), len(df),
+        )
+
+        if len(df) == 0:
+            logger.warning(
+                "DataFrame is empty after filtering!  This usually means "
+                "the batch stats endpoint returned no data.  "
+                "Check the log lines above for 'batch response is a LIST/DICT' "
+                "to confirm whether the API responded correctly."
+            )
+
+        # STEP 6 — reset row numbers (0, 1, 2, …) after filtering
+        df = df.reset_index(drop=True)
+
+        logger.info(
+            "Done! Player DataFrame: %d rows × %d columns.",
+            len(df), len(df.columns),
+        )
+        return df
