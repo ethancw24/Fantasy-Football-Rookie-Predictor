@@ -270,7 +270,7 @@ class FeatureEngineer:
             # Replace 0 with NaN in the denominator to avoid division by zero.
             # A player with 0 NFL yards shouldn't produce Inf or a crash.
             safe_nfl = df[nfl_col].replace(0, pd.NA)
-            df[ratio_col] = (df[college_col] / safe_nfl).round(4)
+            df[ratio_col] = (df[college_col] / safe_nfl).fillna(float("nan")).round(4)
             added += 1
 
         logger.info("    Added %d college-to-NFL ratio columns.", added)

@@ -273,9 +273,10 @@ class DataCleaner:
         else:
             logger.info("    Case 3 (unknown): 0 rows — all players resolved ✓")
 
-        # Convert last_college_season to a nullable integer type.
-        # Regular int can't hold NaN; "Int64" (capital I) can.
-        df["last_college_season"] = df["last_college_season"].astype("Int64")
+        # Convert last_college_season to float64.
+        # We use float64 rather than int because NaN values require a
+        # floating-point type — plain int cannot represent NaN in pandas.
+        df["last_college_season"] = df["last_college_season"].astype("float64")
 
         return df
 

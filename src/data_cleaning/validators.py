@@ -72,8 +72,8 @@ VALID_POSITIONS = {"QB", "RB", "WR", "TE"}
 
 # NFL regular seasons have been 16 or 17 games since 1978.
 # A player cannot have played more games than the season length.
-# We use 17 as the upper limit (current schedule length).
-MAX_GAMES_IN_SEASON = 17
+# We use 18 as the upper limit (current schedule length) + 1 if traded.
+MAX_GAMES_IN_SEASON = 18
 
 # Sanity range for season years.
 # Sleeper data starts around 2015; we add a buffer for future seasons.
@@ -81,13 +81,18 @@ MIN_VALID_SEASON = 2015
 MAX_VALID_SEASON = 2035
 
 # Stat columns that must never be negative.
-# A player cannot have -50 rush yards or -3 touchdowns.
+# IMPORTANT — yards and fantasy points are intentionally excluded here because
+# they CAN legitimately be negative in the NFL:
+#   pass_yards        → negative on a sack behind the line of scrimmage
+#   rush_yards        → negative on a tackle for loss
+#   rec_yards         → negative on a catch behind the LOS tackled for loss
+#   fantasy_pts_*     → negative when turnovers outweigh positive plays
+# We only enforce non-negativity on counts (attempts, completions, TDs, games).
 NON_NEGATIVE_STAT_COLUMNS = [
     "games_played",
-    "pass_attempts", "pass_completions", "pass_yards", "pass_touchdowns",
-    "rush_attempts",  "rush_yards",  "rush_touchdowns",
-    "targets", "receptions", "rec_yards", "rec_touchdowns",
-    "fantasy_pts_half_ppr", "fantasy_pts_ppr",
+    "pass_attempts", "pass_completions", "pass_touchdowns",
+    "rush_attempts",  "rush_touchdowns",
+    "targets", "receptions", "rec_touchdowns",
 ]
 
 
@@ -256,23 +261,25 @@ class DataValidator:
 
     def _check_non_negative_stats(self, df: pd.DataFrame) -> None:
         """
-        Fails if any stat column contains negative values.
+        Warns if any count stat column contains negative values.
 
-        WHY THIS MATTERS:
-            Negative yards, touchdowns, or games played are physically
-            impossible.  They indicate a parsing bug in data_intake.
+        WHY WARN INSTEAD OF RAISE?
+            Yardage columns (pass_yards, rush_yards, rec_yards) and fantasy
+            points CAN legitimately be negative in the NFL — sacks behind
+            the line of scrimmage, tackles for loss, and turnover-heavy
+            games all produce negative values.  We only enforce strict
+            non-negativity on count columns (attempts, completions, TDs,
+            games played) where a negative value is truly impossible.
 
         NOTE:
             We only check columns that actually exist in the DataFrame.
-            Some stat columns (e.g. pass_attempts) may not be present
-            for all data pulls — we skip missing ones gracefully.
+            Some stat columns may not be present for all data pulls —
+            we skip missing ones gracefully.
         """
         cols_to_check = [c for c in NON_NEGATIVE_STAT_COLUMNS if c in df.columns]
 
         for col in cols_to_check:
-            # .lt(0) returns True where the value is less than 0.
-            # We ignore NaN values (they are handled separately).
-            negative_mask = df[col].lt(0)
+            negative_mask  = df[col].lt(0)
             negative_count = negative_mask.sum()
 
             if negative_count > 0:
@@ -281,10 +288,10 @@ class DataValidator:
                     f"Validation failed: {negative_count} negative values found "
                     f"in column '{col}'.\n"
                     f"Sample rows:\n{sample.to_string(index=False)}\n"
-                    f"This suggests a parsing error in data_intake."
+                    f"This column should never be negative — check data_intake."
                 )
 
-        logger.info("  ✓ No negative values in stat columns.")
+        logger.info("  ✓ No negative values in count stat columns.")
 
     def _check_games_played_cap(self, df: pd.DataFrame) -> None:
         """
